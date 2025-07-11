@@ -12,6 +12,13 @@
 (define-constant ERR_INVALID_WEATHER_DATA (err u106))
 (define-constant ERR_ORACLE_NOT_AUTHORIZED (err u107))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u108))
+(define-constant ERR_PORTFOLIO_NOT_FOUND (err u109))
+(define-constant ERR_PORTFOLIO_ALREADY_EXISTS (err u110))
+(define-constant ERR_INVALID_ALLOCATION (err u111))
+(define-constant ERR_CROP_NOT_FOUND (err u112))
+(define-constant ERR_INSUFFICIENT_DIVERSITY (err u113))
+(define-constant ERR_INVALID_CROP_TYPE (err u114))
+(define-constant ERR_PORTFOLIO_LOCKED (err u115))
 
 (define-map policies
   { policy-id: uint }
@@ -47,6 +54,65 @@
 
 (define-data-var policy-counter uint u0)
 (define-data-var contract-balance uint u0)
+(define-data-var portfolio-counter uint u0)
+
+(define-map crop-portfolios
+  { portfolio-id: uint }
+  {
+    farmer: principal,
+    name: (string-ascii 50),
+    total-land-area: uint,
+    target-risk-score: uint,
+    current-risk-score: uint,
+    creation-block: uint,
+    last-rebalance-block: uint,
+    locked: bool,
+    active: bool
+  }
+)
+
+(define-map portfolio-allocations
+  { portfolio-id: uint, crop-type: (string-ascii 50) }
+  {
+    allocated-area: uint,
+    target-percentage: uint,
+    current-percentage: uint,
+    expected-yield: uint,
+    risk-factor: uint,
+    seasonal-multiplier: uint
+  }
+)
+
+(define-map crop-risk-factors
+  { crop-type: (string-ascii 50) }
+  {
+    base-risk: uint,
+    weather-sensitivity: uint,
+    market-volatility: uint,
+    growth-cycle: uint,
+    water-requirement: uint
+  }
+)
+
+(define-map portfolio-performance
+  { portfolio-id: uint, season: uint }
+  {
+    total-yield: uint,
+    total-revenue: uint,
+    risk-adjusted-return: uint,
+    diversity-score: uint,
+    rebalance-needed: bool
+  }
+)
+
+(define-map seasonal-factors
+  { season: uint, crop-type: (string-ascii 50) }
+  {
+    yield-multiplier: uint,
+    price-multiplier: uint,
+    risk-multiplier: uint
+  }
+)
 
 (define-public (create-policy 
   (crop-type (string-ascii 50))
@@ -257,5 +323,301 @@
       expired: (>= stacks-block-height (get end-block policy))
     })
     ERR_POLICY_NOT_FOUND
+  )
+)
+
+(define-public (create-crop-portfolio 
+  (name (string-ascii 50))
+  (total-land-area uint)
+  (target-risk-score uint))
+  (let (
+    (portfolio-id (+ (var-get portfolio-counter) u1))
+  )
+    (asserts! (> total-land-area u0) ERR_INVALID_ALLOCATION)
+    (asserts! (and (>= target-risk-score u1) (<= target-risk-score u100)) ERR_INVALID_ALLOCATION)
+    (asserts! (is-none (map-get? crop-portfolios { portfolio-id: portfolio-id })) ERR_PORTFOLIO_ALREADY_EXISTS)
+    
+    (map-set crop-portfolios
+      { portfolio-id: portfolio-id }
+      {
+        farmer: tx-sender,
+        name: name,
+        total-land-area: total-land-area,
+        target-risk-score: target-risk-score,
+        current-risk-score: u0,
+        creation-block: stacks-block-height,
+        last-rebalance-block: stacks-block-height,
+        locked: false,
+        active: true
+      }
+    )
+    
+    (var-set portfolio-counter portfolio-id)
+    (ok portfolio-id)
+  )
+)
+
+(define-public (allocate-crop-to-portfolio 
+  (portfolio-id uint)
+  (crop-type (string-ascii 50))
+  (allocated-area uint)
+  (target-percentage uint)
+  (expected-yield uint))
+  (let (
+    (portfolio (unwrap! (map-get? crop-portfolios { portfolio-id: portfolio-id }) ERR_PORTFOLIO_NOT_FOUND))
+    (farmer (get farmer portfolio))
+    (total-area (get total-land-area portfolio))
+    (locked (get locked portfolio))
+    (risk-factors (default-to { base-risk: u50, weather-sensitivity: u30, market-volatility: u20, growth-cycle: u10, water-requirement: u25 } 
+                   (map-get? crop-risk-factors { crop-type: crop-type })))
+    (calculated-risk (calculate-crop-risk-factor risk-factors))
+  )
+    (asserts! (is-eq tx-sender farmer) ERR_UNAUTHORIZED)
+    (asserts! (not locked) ERR_PORTFOLIO_LOCKED)
+    (asserts! (> allocated-area u0) ERR_INVALID_ALLOCATION)
+    (asserts! (<= allocated-area total-area) ERR_INVALID_ALLOCATION)
+    (asserts! (and (>= target-percentage u1) (<= target-percentage u100)) ERR_INVALID_ALLOCATION)
+    
+    (map-set portfolio-allocations
+      { portfolio-id: portfolio-id, crop-type: crop-type }
+      {
+        allocated-area: allocated-area,
+        target-percentage: target-percentage,
+        current-percentage: (/ (* allocated-area u100) total-area),
+        expected-yield: expected-yield,
+        risk-factor: calculated-risk,
+        seasonal-multiplier: u100
+      }
+    )
+    
+    (let (
+      (updated-portfolio (merge portfolio { current-risk-score: (calculate-portfolio-risk portfolio-id) }))
+    )
+      (map-set crop-portfolios { portfolio-id: portfolio-id } updated-portfolio)
+      (ok true)
+    )
+  )
+)
+
+(define-public (rebalance-portfolio (portfolio-id uint))
+  (let (
+    (portfolio (unwrap! (map-get? crop-portfolios { portfolio-id: portfolio-id }) ERR_PORTFOLIO_NOT_FOUND))
+    (farmer (get farmer portfolio))
+    (locked (get locked portfolio))
+    (active (get active portfolio))
+    (last-rebalance (get last-rebalance-block portfolio))
+    (min-rebalance-interval u1008)
+  )
+    (asserts! (is-eq tx-sender farmer) ERR_UNAUTHORIZED)
+    (asserts! active ERR_PORTFOLIO_NOT_FOUND)
+    (asserts! (not locked) ERR_PORTFOLIO_LOCKED)
+    (asserts! (>= (- stacks-block-height last-rebalance) min-rebalance-interval) ERR_INVALID_ALLOCATION)
+    
+    (let (
+      (diversity-score (calculate-portfolio-diversity portfolio-id))
+      (rebalance-needed (< diversity-score u60))
+    )
+      (if rebalance-needed
+        (begin
+          (map-set crop-portfolios
+            { portfolio-id: portfolio-id }
+            (merge portfolio { 
+              last-rebalance-block: stacks-block-height,
+              current-risk-score: (calculate-portfolio-risk portfolio-id)
+            })
+          )
+          (ok { rebalanced: true, diversity-score: diversity-score })
+        )
+        (ok { rebalanced: false, diversity-score: diversity-score })
+      )
+    )
+  )
+)
+
+(define-public (set-crop-risk-factors 
+  (crop-type (string-ascii 50))
+  (base-risk uint)
+  (weather-sensitivity uint)
+  (market-volatility uint)
+  (growth-cycle uint)
+  (water-requirement uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (<= base-risk u100) (<= weather-sensitivity u100) (<= market-volatility u100)) ERR_INVALID_ALLOCATION)
+    (asserts! (and (<= growth-cycle u365) (<= water-requirement u100)) ERR_INVALID_ALLOCATION)
+    
+    (map-set crop-risk-factors
+      { crop-type: crop-type }
+      {
+        base-risk: base-risk,
+        weather-sensitivity: weather-sensitivity,
+        market-volatility: market-volatility,
+        growth-cycle: growth-cycle,
+        water-requirement: water-requirement
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-seasonal-factors 
+  (season uint)
+  (crop-type (string-ascii 50))
+  (yield-multiplier uint)
+  (price-multiplier uint)
+  (risk-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (>= season u1) (<= season u4)) ERR_INVALID_ALLOCATION)
+    (asserts! (and (>= yield-multiplier u50) (<= yield-multiplier u200)) ERR_INVALID_ALLOCATION)
+    (asserts! (and (>= price-multiplier u50) (<= price-multiplier u200)) ERR_INVALID_ALLOCATION)
+    (asserts! (and (>= risk-multiplier u50) (<= risk-multiplier u200)) ERR_INVALID_ALLOCATION)
+    
+    (map-set seasonal-factors
+      { season: season, crop-type: crop-type }
+      {
+        yield-multiplier: yield-multiplier,
+        price-multiplier: price-multiplier,
+        risk-multiplier: risk-multiplier
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (record-portfolio-performance 
+  (portfolio-id uint)
+  (season uint)
+  (total-yield uint)
+  (total-revenue uint))
+  (let (
+    (portfolio (unwrap! (map-get? crop-portfolios { portfolio-id: portfolio-id }) ERR_PORTFOLIO_NOT_FOUND))
+    (farmer (get farmer portfolio))
+    (diversity-score (calculate-portfolio-diversity portfolio-id))
+    (risk-score (get current-risk-score portfolio))
+    (risk-adjusted-return (calculate-risk-adjusted-return total-revenue risk-score))
+    (rebalance-needed (< diversity-score u60))
+  )
+    (asserts! (is-eq tx-sender farmer) ERR_UNAUTHORIZED)
+    (asserts! (and (>= season u1) (<= season u4)) ERR_INVALID_ALLOCATION)
+    
+    (map-set portfolio-performance
+      { portfolio-id: portfolio-id, season: season }
+      {
+        total-yield: total-yield,
+        total-revenue: total-revenue,
+        risk-adjusted-return: risk-adjusted-return,
+        diversity-score: diversity-score,
+        rebalance-needed: rebalance-needed
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-portfolio (portfolio-id uint))
+  (map-get? crop-portfolios { portfolio-id: portfolio-id })
+)
+
+(define-read-only (get-portfolio-allocation (portfolio-id uint) (crop-type (string-ascii 50)))
+  (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: crop-type })
+)
+
+(define-read-only (get-crop-risk-factors (crop-type (string-ascii 50)))
+  (map-get? crop-risk-factors { crop-type: crop-type })
+)
+
+(define-read-only (get-portfolio-performance (portfolio-id uint) (season uint))
+  (map-get? portfolio-performance { portfolio-id: portfolio-id, season: season })
+)
+
+(define-read-only (get-seasonal-factors (season uint) (crop-type (string-ascii 50)))
+  (map-get? seasonal-factors { season: season, crop-type: crop-type })
+)
+
+(define-read-only (get-portfolio-count)
+  (var-get portfolio-counter)
+)
+
+(define-private (calculate-crop-risk-factor (risk-factors { base-risk: uint, weather-sensitivity: uint, market-volatility: uint, growth-cycle: uint, water-requirement: uint }))
+  (let (
+    (base (get base-risk risk-factors))
+    (weather (get weather-sensitivity risk-factors))
+    (market (get market-volatility risk-factors))
+    (cycle (get growth-cycle risk-factors))
+    (water (get water-requirement risk-factors))
+    (weighted-risk (+ (* base u3) (* weather u2) (* market u2) (* cycle u1) (* water u1)))
+  )
+    (/ weighted-risk u9)
+  )
+)
+
+(define-private (calculate-portfolio-risk (portfolio-id uint))
+  (let (
+    (portfolio (default-to { farmer: tx-sender, name: "", total-land-area: u0, target-risk-score: u0, current-risk-score: u0, creation-block: u0, last-rebalance-block: u0, locked: false, active: false } 
+               (map-get? crop-portfolios { portfolio-id: portfolio-id })))
+    (total-area (get total-land-area portfolio))
+  )
+    (if (> total-area u0)
+      (calculate-weighted-risk portfolio-id total-area)
+      u0
+    )
+  )
+)
+
+(define-private (calculate-weighted-risk (portfolio-id uint) (total-area uint))
+  (let (
+    (crop-1-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "wheat" }))
+    (crop-2-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "corn" }))
+    (crop-3-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "soybeans" }))
+    (weighted-risk-1 (if (is-some crop-1-alloc) 
+                       (/ (* (get risk-factor (unwrap-panic crop-1-alloc)) (get allocated-area (unwrap-panic crop-1-alloc))) total-area)
+                       u0))
+    (weighted-risk-2 (if (is-some crop-2-alloc) 
+                       (/ (* (get risk-factor (unwrap-panic crop-2-alloc)) (get allocated-area (unwrap-panic crop-2-alloc))) total-area)
+                       u0))
+    (weighted-risk-3 (if (is-some crop-3-alloc) 
+                       (/ (* (get risk-factor (unwrap-panic crop-3-alloc)) (get allocated-area (unwrap-panic crop-3-alloc))) total-area)
+                       u0))
+  )
+    (+ weighted-risk-1 weighted-risk-2 weighted-risk-3)
+  )
+)
+
+(define-private (calculate-portfolio-diversity (portfolio-id uint))
+  (let (
+    (crop-1-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "wheat" }))
+    (crop-2-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "corn" }))
+    (crop-3-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "soybeans" }))
+    (crop-count (+ (if (is-some crop-1-alloc) u1 u0) (if (is-some crop-2-alloc) u1 u0) (if (is-some crop-3-alloc) u1 u0)))
+    (base-diversity (* crop-count u20))
+    (allocation-balance (calculate-allocation-balance portfolio-id))
+  )
+    (+ base-diversity allocation-balance)
+  )
+)
+
+(define-private (calculate-allocation-balance (portfolio-id uint))
+  (let (
+    (crop-1-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "wheat" }))
+    (crop-2-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "corn" }))
+    (crop-3-alloc (map-get? portfolio-allocations { portfolio-id: portfolio-id, crop-type: "soybeans" }))
+    (pct-1 (if (is-some crop-1-alloc) (get current-percentage (unwrap-panic crop-1-alloc)) u0))
+    (pct-2 (if (is-some crop-2-alloc) (get current-percentage (unwrap-panic crop-2-alloc)) u0))
+    (pct-3 (if (is-some crop-3-alloc) (get current-percentage (unwrap-panic crop-3-alloc)) u0))
+    (ideal-pct u33)
+    (deviation-1 (if (> pct-1 ideal-pct) (- pct-1 ideal-pct) (- ideal-pct pct-1)))
+    (deviation-2 (if (> pct-2 ideal-pct) (- pct-2 ideal-pct) (- ideal-pct pct-2)))
+    (deviation-3 (if (> pct-3 ideal-pct) (- pct-3 ideal-pct) (- ideal-pct pct-3)))
+    (total-deviation (+ deviation-1 deviation-2 deviation-3))
+  )
+    (if (< total-deviation u30) u40 (- u40 (/ total-deviation u3)))
+  )
+)
+
+(define-private (calculate-risk-adjusted-return (revenue uint) (risk-score uint))
+  (if (> risk-score u0)
+    (/ (* revenue u100) risk-score)
+    revenue
   )
 )
