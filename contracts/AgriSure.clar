@@ -19,6 +19,11 @@
 (define-constant ERR_INSUFFICIENT_DIVERSITY (err u113))
 (define-constant ERR_INVALID_CROP_TYPE (err u114))
 (define-constant ERR_PORTFOLIO_LOCKED (err u115))
+(define-constant ERR_FARMER_NOT_REGISTERED (err u116))
+(define-constant ERR_INVALID_RATING (err u117))
+(define-constant ERR_INSUFFICIENT_HISTORY (err u118))
+(define-constant ERR_FARM_ALREADY_REGISTERED (err u119))
+(define-constant ERR_INVALID_FARM_DATA (err u120))
 
 (define-map policies
   { policy-id: uint }
@@ -55,6 +60,59 @@
 (define-data-var policy-counter uint u0)
 (define-data-var contract-balance uint u0)
 (define-data-var portfolio-counter uint u0)
+(define-data-var farmer-counter uint u0)
+
+(define-map farmer-profiles
+  { farmer: principal }
+  {
+    registration-block: uint,
+    total-policies: uint,
+    total-claims: uint,
+    total-premiums-paid: uint,
+    total-payouts-received: uint,
+    current-risk-score: uint,
+    reputation-score: uint,
+    active: bool
+  }
+)
+
+(define-map farm-characteristics
+  { farmer: principal }
+  {
+    farm-size: uint,
+    soil-quality-score: uint,
+    irrigation-type: uint,
+    years-experience: uint,
+    organic-certified: bool,
+    climate-zone: uint,
+    elevation: uint,
+    water-access-score: uint
+  }
+)
+
+(define-map performance-history
+  { farmer: principal, year: uint }
+  {
+    policies-created: uint,
+    claims-filed: uint,
+    successful-harvests: uint,
+    total-yield: uint,
+    premium-discount: uint,
+    performance-rating: uint
+  }
+)
+
+(define-map premium-adjustments
+  { farmer: principal }
+  {
+    base-multiplier: uint,
+    risk-multiplier: uint,
+    reputation-multiplier: uint,
+    experience-multiplier: uint,
+    final-multiplier: uint,
+    last-updated: uint
+  }
+)
 
 (define-map crop-portfolios
   { portfolio-id: uint }
@@ -123,14 +181,15 @@
   (max-temperature uint))
   (let (
     (policy-id (+ (var-get policy-counter) u1))
-    (premium (/ coverage-amount u10))
+    (base-premium (/ coverage-amount u10))
+    (adjusted-premium (calculate-adjusted-premium tx-sender base-premium))
     (start-block stacks-block-height)
     (end-block (+ stacks-block-height duration-blocks))
   )
-    (asserts! (>= (stx-get-balance tx-sender) premium) ERR_INSUFFICIENT_PREMIUM)
+    (asserts! (>= (stx-get-balance tx-sender) adjusted-premium) ERR_INSUFFICIENT_PREMIUM)
     (asserts! (is-none (map-get? policies { policy-id: policy-id })) ERR_POLICY_ALREADY_EXISTS)
     
-    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    (try! (stx-transfer? adjusted-premium tx-sender (as-contract tx-sender)))
     
     (map-set policies
       { policy-id: policy-id }
@@ -138,7 +197,7 @@
         farmer: tx-sender,
         crop-type: crop-type,
         coverage-amount: coverage-amount,
-        premium-paid: premium,
+        premium-paid: adjusted-premium,
         start-block: start-block,
         end-block: end-block,
         location: location,
@@ -149,8 +208,9 @@
       }
     )
     
+    (unwrap-panic (update-farmer-stats tx-sender adjusted-premium))
     (var-set policy-counter policy-id)
-    (var-set contract-balance (+ (var-get contract-balance) premium))
+    (var-set contract-balance (+ (var-get contract-balance) adjusted-premium))
     (ok policy-id)
   )
 )
@@ -621,3 +681,318 @@
     revenue
   )
 )
+
+(define-public (register-farmer 
+  (farm-size uint)
+  (soil-quality-score uint)
+  (irrigation-type uint)
+  (years-experience uint)
+  (organic-certified bool)
+  (climate-zone uint)
+  (elevation uint)
+  (water-access-score uint))
+  (begin
+    (asserts! (is-none (map-get? farmer-profiles { farmer: tx-sender })) ERR_FARM_ALREADY_REGISTERED)
+    (asserts! (and (> farm-size u0) (<= farm-size u10000)) ERR_INVALID_FARM_DATA)
+    (asserts! (and (>= soil-quality-score u1) (<= soil-quality-score u100)) ERR_INVALID_FARM_DATA)
+    (asserts! (<= irrigation-type u3) ERR_INVALID_FARM_DATA)
+    (asserts! (<= years-experience u100) ERR_INVALID_FARM_DATA)
+    (asserts! (and (>= climate-zone u1) (<= climate-zone u10)) ERR_INVALID_FARM_DATA)
+    (asserts! (<= elevation u5000) ERR_INVALID_FARM_DATA)
+    (asserts! (and (>= water-access-score u1) (<= water-access-score u100)) ERR_INVALID_FARM_DATA)
+    
+    (map-set farmer-profiles
+      { farmer: tx-sender }
+      {
+        registration-block: stacks-block-height,
+        total-policies: u0,
+        total-claims: u0,
+        total-premiums-paid: u0,
+        total-payouts-received: u0,
+        current-risk-score: u50,
+        reputation-score: u50,
+        active: true
+      }
+    )
+    
+    (map-set farm-characteristics
+      { farmer: tx-sender }
+      {
+        farm-size: farm-size,
+        soil-quality-score: soil-quality-score,
+        irrigation-type: irrigation-type,
+        years-experience: years-experience,
+        organic-certified: organic-certified,
+        climate-zone: climate-zone,
+        elevation: elevation,
+        water-access-score: water-access-score
+      }
+    )
+    
+    (try! (calculate-initial-premium-adjustment tx-sender))
+    (var-set farmer-counter (+ (var-get farmer-counter) u1))
+    (ok true)
+  )
+)
+
+(define-public (update-performance-record 
+  (year uint)
+  (policies-created uint)
+  (claims-filed uint)
+  (successful-harvests uint)
+  (total-yield uint))
+  (let (
+    (farmer-profile (unwrap! (map-get? farmer-profiles { farmer: tx-sender }) ERR_FARMER_NOT_REGISTERED))
+    (performance-rating (calculate-performance-rating claims-filed policies-created successful-harvests))
+    (premium-discount (calculate-premium-discount performance-rating))
+  )
+    (asserts! (and (>= year u2020) (<= year u2050)) ERR_INVALID_FARM_DATA)
+    (asserts! (<= claims-filed policies-created) ERR_INVALID_FARM_DATA)
+    
+    (map-set performance-history
+      { farmer: tx-sender, year: year }
+      {
+        policies-created: policies-created,
+        claims-filed: claims-filed,
+        successful-harvests: successful-harvests,
+        total-yield: total-yield,
+        premium-discount: premium-discount,
+        performance-rating: performance-rating
+      }
+    )
+    
+    (try! (update-risk-score tx-sender))
+    (try! (update-reputation-score tx-sender))
+    (try! (recalculate-premium-adjustment tx-sender))
+    (ok true)
+  )
+)
+
+(define-public (update-farmer-stats (farmer principal) (premium-paid uint))
+  (let (
+    (profile (default-to 
+      { registration-block: stacks-block-height, total-policies: u0, total-claims: u0, total-premiums-paid: u0, total-payouts-received: u0, current-risk-score: u50, reputation-score: u50, active: true }
+      (map-get? farmer-profiles { farmer: farmer })))
+  )
+    (map-set farmer-profiles
+      { farmer: farmer }
+      (merge profile {
+        total-policies: (+ (get total-policies profile) u1),
+        total-premiums-paid: (+ (get total-premiums-paid profile) premium-paid)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (record-claim-payout (farmer principal) (payout-amount uint))
+  (let (
+    (profile (unwrap! (map-get? farmer-profiles { farmer: farmer }) ERR_FARMER_NOT_REGISTERED))
+  )
+    (map-set farmer-profiles
+      { farmer: farmer }
+      (merge profile {
+        total-claims: (+ (get total-claims profile) u1),
+        total-payouts-received: (+ (get total-payouts-received profile) payout-amount)
+      })
+    )
+    (try! (update-risk-score farmer))
+    (try! (recalculate-premium-adjustment farmer))
+    (ok true)
+  )
+)
+
+(define-public (calculate-initial-premium-adjustment (farmer principal))
+  (let (
+    (farm-chars (unwrap! (map-get? farm-characteristics { farmer: farmer }) ERR_FARMER_NOT_REGISTERED))
+    (experience-mult (calculate-experience-multiplier (get years-experience farm-chars)))
+    (farm-quality-mult (calculate-farm-quality-multiplier farm-chars))
+  )
+    (map-set premium-adjustments
+      { farmer: farmer }
+      {
+        base-multiplier: u100,
+        risk-multiplier: u100,
+        reputation-multiplier: u100,
+        experience-multiplier: experience-mult,
+        final-multiplier: (/ (* u100 experience-mult farm-quality-mult) u10000),
+        last-updated: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (recalculate-premium-adjustment (farmer principal))
+  (let (
+    (profile (unwrap! (map-get? farmer-profiles { farmer: farmer }) ERR_FARMER_NOT_REGISTERED))
+    (farm-chars (unwrap! (map-get? farm-characteristics { farmer: farmer }) ERR_FARMER_NOT_REGISTERED))
+    (risk-mult (calculate-risk-multiplier (get current-risk-score profile)))
+    (reputation-mult (calculate-reputation-multiplier (get reputation-score profile)))
+    (experience-mult (calculate-experience-multiplier (get years-experience farm-chars)))
+    (farm-quality-mult (calculate-farm-quality-multiplier farm-chars))
+    (final-mult (/ (* risk-mult reputation-mult experience-mult farm-quality-mult) u1000000))
+  )
+    (map-set premium-adjustments
+      { farmer: farmer }
+      {
+        base-multiplier: u100,
+        risk-multiplier: risk-mult,
+        reputation-multiplier: reputation-mult,
+        experience-multiplier: experience-mult,
+        final-multiplier: final-mult,
+        last-updated: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-farmer-profile (farmer principal))
+  (map-get? farmer-profiles { farmer: farmer })
+)
+
+(define-read-only (get-farm-characteristics (farmer principal))
+  (map-get? farm-characteristics { farmer: farmer })
+)
+
+(define-read-only (get-performance-history (farmer principal) (year uint))
+  (map-get? performance-history { farmer: farmer, year: year })
+)
+
+(define-read-only (get-premium-adjustment (farmer principal))
+  (map-get? premium-adjustments { farmer: farmer })
+)
+
+(define-read-only (get-farmer-count)
+  (var-get farmer-counter)
+)
+
+(define-read-only (calculate-adjusted-premium (farmer principal) (base-premium uint))
+  (let (
+    (adjustment (map-get? premium-adjustments { farmer: farmer }))
+  )
+    (if (is-some adjustment)
+      (/ (* base-premium (get final-multiplier (unwrap-panic adjustment))) u100)
+      base-premium
+    )
+  )
+)
+
+(define-private (update-risk-score (farmer principal))
+  (let (
+    (profile (unwrap! (map-get? farmer-profiles { farmer: farmer }) ERR_FARMER_NOT_REGISTERED))
+    (total-policies (get total-policies profile))
+    (total-claims (get total-claims profile))
+    (claim-ratio (if (> total-policies u0) (/ (* total-claims u100) total-policies) u0))
+    (new-risk-score (+ u30 (/ claim-ratio u2)))
+  )
+    (map-set farmer-profiles
+      { farmer: farmer }
+      (merge profile { current-risk-score: (if (> new-risk-score u100) u100 new-risk-score) })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-reputation-score (farmer principal))
+  (let (
+    (profile (unwrap! (map-get? farmer-profiles { farmer: farmer }) ERR_FARMER_NOT_REGISTERED))
+    (blocks-since-registration (- stacks-block-height (get registration-block profile)))
+    (total-policies (get total-policies profile))
+    (total-claims (get total-claims profile))
+    (longevity-bonus (if (> blocks-since-registration u52560) u10 u0))
+    (activity-bonus (if (> total-policies u5) u10 u0))
+    (claim-penalty (if (> total-claims u0) (* total-claims u5) u0))
+    (new-reputation (+ u50 longevity-bonus activity-bonus (- claim-penalty)))
+  )
+    (map-set farmer-profiles
+      { farmer: farmer }
+      (merge profile { 
+        reputation-score: (if (> new-reputation u100) u100 (if (< new-reputation u1) u1 new-reputation))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-performance-rating (claims-filed uint) (policies-created uint) (successful-harvests uint))
+  (let (
+    (claim-ratio (if (> policies-created u0) (/ (* claims-filed u100) policies-created) u0))
+    (harvest-success-ratio (if (> policies-created u0) (/ (* successful-harvests u100) policies-created) u0))
+    (base-rating u50)
+    (claim-penalty (/ claim-ratio u2))
+    (harvest-bonus (/ harvest-success-ratio u4))
+  )
+    (let ((final-rating (+ base-rating harvest-bonus (- claim-penalty))))
+      (if (> final-rating u100) u100 (if (< final-rating u1) u1 final-rating))
+    )
+  )
+)
+
+(define-private (calculate-premium-discount (performance-rating uint))
+  (if (>= performance-rating u80)
+    u20
+    (if (>= performance-rating u60)
+      u10
+      (if (>= performance-rating u40)
+        u5
+        u0
+      )
+    )
+  )
+)
+
+(define-private (calculate-risk-multiplier (risk-score uint))
+  (if (<= risk-score u30)
+    u80
+    (if (<= risk-score u50)
+      u100
+      (if (<= risk-score u70)
+        u120
+        u150
+      )
+    )
+  )
+)
+
+(define-private (calculate-reputation-multiplier (reputation-score uint))
+  (if (>= reputation-score u80)
+    u85
+    (if (>= reputation-score u60)
+      u95
+      (if (>= reputation-score u40)
+        u105
+        u115
+      )
+    )
+  )
+)
+
+(define-private (calculate-experience-multiplier (years-experience uint))
+  (if (>= years-experience u20)
+    u85
+    (if (>= years-experience u10)
+      u90
+      (if (>= years-experience u5)
+        u95
+        u105
+      )
+    )
+  )
+)
+
+(define-private (calculate-farm-quality-multiplier 
+  (farm-chars { farm-size: uint, soil-quality-score: uint, irrigation-type: uint, years-experience: uint, organic-certified: bool, climate-zone: uint, elevation: uint, water-access-score: uint }))
+  (let (
+    (soil-bonus (if (>= (get soil-quality-score farm-chars) u80) u95 u100))
+    (irrigation-bonus (if (<= (get irrigation-type farm-chars) u1) u95 u100))
+    (water-bonus (if (>= (get water-access-score farm-chars) u80) u95 u100))
+    (organic-bonus (if (get organic-certified farm-chars) u90 u100))
+  )
+    (/ (* soil-bonus irrigation-bonus water-bonus organic-bonus) u1000000)
+  )
+)
+
+
+
