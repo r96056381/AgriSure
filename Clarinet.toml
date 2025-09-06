@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/AgriSure.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.RiskAnalytics]
+path = 'contracts/RiskAnalytics.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
